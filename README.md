@@ -4,6 +4,11 @@
 [![Python](https://img.shields.io/badge/python-3.11%20%E2%80%93%203.13-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
+> **In plain terms:** when an AI asks "are you sure?", the yes you give applies
+> only to the exact thing you were shown. It cannot be quietly reused to approve
+> something else — approving the deletion of a cache file cannot become a deleted
+> contract.
+
 **An MCP server whose confirmation dialog cannot be replayed against a different
 call.**
 
