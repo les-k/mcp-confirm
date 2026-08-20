@@ -250,13 +250,53 @@ async def test_a_file_swapped_for_a_link_after_confirmation_is_refused(
     cache.unlink()
     os.symlink(treasure, cache)
 
-    with pytest.raises(ToolError, match="is now a link"):
+    with pytest.raises(ToolError, match="is a link"):
         await server.call_tool(
             "delete_file", {"path": str(cache)}, retry(asked.request_state)
         )
 
     assert treasure.exists(), "the guard must not have followed the link"
     assert treasure.read_text(encoding="utf-8") == "not for you"
+
+
+async def test_a_swap_aimed_inside_the_root_is_refused(
+    workspace: Path, secret: bytes, symlinks_allowed: bool
+):
+    """The swap the previous test does not actually exercise.
+
+    That one aims its replacement link *outside* the allowed root, where
+    containment refuses it during path resolution before the link check is ever
+    consulted - the right outcome, reached by luck, because resolve() happened
+    to land somewhere already forbidden.
+
+    Here the link points at a second real file that is legitimately inside the
+    same root. Containment resolves it, finds the destination in-bounds, and
+    hands back that resolved path - so a link check running afterwards would
+    inspect the destination, see an ordinary file, and approve deleting the
+    file the user never agreed to.
+
+    CI caught exactly this on the first push. It is the reason _refuse_if_link
+    runs on the unresolved path before containment.
+    """
+    if not symlinks_allowed:
+        pytest.skip("this process cannot create symlinks")
+
+    server, _ = make_server(workspace, secret)
+    cache = workspace / "cache.txt"
+    thesis = workspace / "thesis.txt"
+
+    asked = await ask(server, cache)
+
+    cache.unlink()
+    os.symlink(thesis, cache)
+
+    with pytest.raises(ToolError, match="is a link"):
+        await server.call_tool(
+            "delete_file", {"path": str(cache)}, retry(asked.request_state)
+        )
+
+    assert thesis.exists(), "the guard must not have deleted the file it was swapped for"
+    assert thesis.read_text(encoding="utf-8") == "years of work"
 
 
 async def test_a_file_deleted_between_rounds_is_reported_not_crashed(

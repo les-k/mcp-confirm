@@ -76,6 +76,28 @@ def _resolve_roots(roots: Sequence[Path | str]) -> tuple[Path, ...]:
     return tuple(resolved)
 
 
+def _refuse_if_link(path: str) -> None:
+    """Reject a symlink, judged on the path as written.
+
+    This must run *before* ``_contain``, and the ordering is the whole point.
+    ``_contain`` calls ``Path.resolve()``, which follows a symlink to its
+    destination and returns that - so a link check afterwards inspects wherever
+    the link points, not the link itself. A swap aimed at another real file
+    inside an allowed root would resolve cleanly, pass containment, and be
+    deleted as though it were the file the user approved.
+
+    Checking here, on the unresolved path, is what makes a swap a link
+    regardless of where it leads.
+    """
+    raw = Path(path).expanduser()
+    try:
+        if raw.is_symlink():
+            raise Rejected(f"{raw} is a link; this tool refuses to act through one")
+    except OSError as exc:
+        # A path we cannot even classify is not one to delete.
+        raise Rejected(f"cannot inspect {raw}: {exc}") from exc
+
+
 def _contain(path: str, roots: tuple[Path, ...]) -> Path:
     """Resolve a path and confirm it sits inside an allowed root."""
     if not roots:
@@ -156,6 +178,7 @@ def build_server(
         principal = _principal(ctx)
         params = {"path": path}
 
+        _refuse_if_link(path)
         target = _contain(path, allowed)
 
         responses = ctx.input_responses or {}
@@ -211,8 +234,9 @@ def build_server(
         # Re-check the filesystem now, rather than trusting what was true when
         # the question was asked. The user thought about it in between, and
         # anything could have replaced the target in that window.
-        if target.is_symlink():
-            raise Rejected(f"{target} is now a link; it was a regular file when confirmed")
+        # The link check already ran above, on the unresolved path, which is the
+        # only place it can catch a swap. What remains here is the rest of the
+        # re-validation: the file must still be there, and still be a file.
         if not target.exists():
             raise Rejected(f"{target} no longer exists")
         if not target.is_file():

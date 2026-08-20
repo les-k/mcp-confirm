@@ -146,6 +146,28 @@ CI runs on Ubuntu only, deliberately: the swap-after-confirmation test needs
 symlinks, and the build **fails if that test reports as skipped there**. A suite
 that silently skips its most important case is decoration.
 
+### The first push did not pass, and the bug was a real one
+
+CI rejected the initial commit, and it was not a trivial failure. `_contain()`
+calls `Path.resolve()`, which follows a symlink to its destination — so
+`target` was already resolved by the time `target.is_symlink()` ran, meaning
+that check inspected **where the link pointed, not the link itself**.
+
+The original test passed safely only by accident: its replacement symlink
+pointed *outside* the allowed root, so containment refused it first and the
+link check was never reached. Aim that link at another real file *inside* the
+same root and the guard collapsed entirely — containment resolves it, finds the
+destination legitimately in-bounds, `is_symlink()` sees an ordinary file, and
+the server deletes a file the user never approved.
+
+In the one project whose entire claim is that you cannot approve one thing and
+get another.
+
+The fix moves the link check onto the **unresolved** path, before containment
+runs. `test_a_swap_aimed_inside_the_root_is_refused` covers the variant the
+original test never exercised. Left in the history rather than tidied away,
+because a guard nobody has watched fail is a guard nobody has tested.
+
 ## Scanner results
 
 Run against [`agent-audit`](https://pypi.org/project/agent-audit/) 0.19.2.
