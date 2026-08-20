@@ -1,33 +1,33 @@
-"""The protocol layer: a thin translation over ``state`` and ``prompt``.
+"""The protocol layer: three controls the SDK's own boundary does not provide.
 
-The demonstration tool deletes a file. It was chosen because deletion is
-irreversible, which is the only category of action where a confirmation dialog
-is load-bearing rather than decorative — if getting it wrong merely meant an
-error message, none of the machinery in ``state.py`` would be worth writing.
+The demonstration tool deletes a file. Deletion was chosen because it is
+irreversible, which is the only category of action where a confirmation is
+load-bearing rather than decorative.
 
-The full round trip:
+**What this file does not do.** It does not sign, encrypt, or bind the
+confirmation state. `RequestStateBoundary` — installed by default on every
+`MCPServer` — already seals it under AES-256-GCM and binds it to the method,
+target, argument digest, audience and principal. Verified empirically, not
+inferred: present a state sealed for `delete_file(cache.txt)` on a call to
+`delete_file(thesis.txt)` and the SDK answers "Invalid or expired
+requestState" before this module runs at all. Reimplementing that by hand
+would be worse code guarding an already-closed hole.
 
-1. ``delete_file(path)`` arrives with no input responses. The server checks the
-   path is inside an allowed root, builds a sanitised question, mints a state
-   blob bound to *this* principal, *this* method and *these* arguments, and
-   answers ``InputRequiredResult``.
-2. The client shows the question, collects an answer, and re-issues the call
-   with ``inputResponses`` and the echoed ``requestState``.
-3. The server verifies the state against the arguments of *the retry*, checks
-   the user actually accepted, re-checks the file on disk, and only then
-   deletes.
+**What it does do**, because the boundary does not and in two cases cannot:
 
-Step 3 verifies against the retry's arguments rather than remembering the
-first call's. That is the entire point: the server keeps no memory between
-rounds, so the only thing tying the approval to the action is the digest
-sealed inside the state.
+1. **Spends the confirmation.** The boundary binds and expires state; it never
+   consumes it. Inside the TTL the same approval verifies repeatedly. See
+   `singleuse.py`.
+2. **Sanitises the question.** The elicitation message is text a human reads
+   and acts on, with an untrusted value interpolated into it. See `prompt.py`.
+3. **Re-checks the target at execution time.** The user thought about it in
+   between, and the filesystem can change in that window. No protocol layer
+   can know what "unchanged" means for a given tool.
 """
 
 from __future__ import annotations
 
 import argparse
-import os
-import secrets
 import sys
 import time
 from collections.abc import Callable, Sequence
@@ -43,7 +43,7 @@ from mcp.types import (
 )
 
 from .prompt import safe_value
-from .state import ConfirmationState, Rejected
+from .singleuse import Rejected, SingleUseLedger
 
 __all__ = ["build_server", "main"]
 
@@ -79,22 +79,20 @@ def _resolve_roots(roots: Sequence[Path | str]) -> tuple[Path, ...]:
 def _refuse_if_link(path: str) -> None:
     """Reject a symlink, judged on the path as written.
 
-    This must run *before* ``_contain``, and the ordering is the whole point.
-    ``_contain`` calls ``Path.resolve()``, which follows a symlink to its
-    destination and returns that - so a link check afterwards inspects wherever
+    This must run *before* `_contain`, and the ordering is the whole point.
+    `_contain` calls `Path.resolve()`, which follows a symlink to its
+    destination and returns that — so a link check afterwards inspects wherever
     the link points, not the link itself. A swap aimed at another real file
     inside an allowed root would resolve cleanly, pass containment, and be
     deleted as though it were the file the user approved.
 
-    Checking here, on the unresolved path, is what makes a swap a link
-    regardless of where it leads.
+    CI caught exactly this on the first version of this repository.
     """
     raw = Path(path).expanduser()
     try:
         if raw.is_symlink():
             raise Rejected(f"{raw} is a link; this tool refuses to act through one")
     except OSError as exc:
-        # A path we cannot even classify is not one to delete.
         raise Rejected(f"cannot inspect {raw}: {exc}") from exc
 
 
@@ -113,48 +111,29 @@ def _contain(path: str, roots: tuple[Path, ...]) -> Path:
     raise Rejected(f"{candidate} is outside the allowed roots ({allowed})")
 
 
-def _principal(ctx: Context) -> str:
-    """Best available identity for the caller.
-
-    Over stdio there is no authenticated principal at all, so this collapses to
-    a constant and the principal binding in ``state`` becomes vestigial. That
-    is stated plainly rather than papered over: the binding is meaningful for
-    an HTTP deployment carrying a verified token, and is dead weight for a
-    local single-user process. The code path stays identical either way so the
-    HTTP case is not an untested afterthought.
-    """
-    try:
-        request = ctx.request_context
-    except (ValueError, AttributeError):
-        # `request_context` raises rather than returning None when there is no
-        # active request, so this cannot be a getattr default.
-        return "local-stdio"
-
-    for attribute in ("user", "principal", "client_id"):
-        value = getattr(request, attribute, None)
-        if isinstance(value, str) and value:
-            return value
-    return "local-stdio"
-
-
 def build_server(
     roots: Sequence[Path | str],
     *,
-    secret: bytes,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     clock: Callable[[], int] = lambda: int(time.time()),
 ) -> MCPServer:
-    """Wire the tool up. ``clock`` is injected so expiry is testable."""
+    """Wire the tool up. `clock` is injected so expiry is testable.
+
+    No signing key is taken, because none is needed: `MCPServer` installs
+    `RequestStateBoundary` with an ephemeral key of its own. Pass
+    `request_state_security=` to `MCPServer` if you need shared keys across
+    replicas — and read the note in `singleuse.py` before you do, because the
+    ledger here is per-process.
+    """
     allowed = _resolve_roots(roots)
-    states = ConfirmationState(secret, ttl_seconds=ttl_seconds)
+    ledger = SingleUseLedger(ttl_seconds=ttl_seconds)
 
     server = MCPServer(
         name="mcp-confirm",
         instructions=(
             "Deletes a file, but only after the user has confirmed that exact "
-            "deletion. Confirmations are cryptographically bound to the path "
-            "they were granted for, so an approval for one file cannot be "
-            "replayed against another."
+            "deletion. The confirmation is single-use and is re-checked against "
+            "the filesystem at the moment of deletion."
         ),
     )
 
@@ -162,9 +141,8 @@ def build_server(
         name=_METHOD,
         description=(
             "Delete a single file inside the server's configured roots. Asks the "
-            "user to confirm first and will not proceed without that answer. The "
-            "confirmation is bound to this exact path: it cannot be reused for a "
-            "different file, by a different caller, or after it expires."
+            "user to confirm first and will not proceed without that answer. Each "
+            "confirmation can be redeemed once."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -175,8 +153,6 @@ def build_server(
     )
     async def delete_file(path: str, ctx: Context) -> str:
         now = clock()
-        principal = _principal(ctx)
-        params = {"path": path}
 
         _refuse_if_link(path)
         target = _contain(path, allowed)
@@ -207,24 +183,21 @@ def build_server(
                         ),
                     )
                 },
-                request_state=states.issue(
-                    principal=principal, method=_METHOD, params=params, now=now
-                ),
+                # Sealed by RequestStateBoundary on the way out and unsealed on
+                # the retry, so what arrives back is plaintext this process
+                # minted, bound to this exact call.
+                request_state=ledger.issue(now=now),
             )
 
-        # Round two. Verify the approval before believing any of it.
+        # Round two.
         if not isinstance(answer, ElicitResult):
             raise Rejected("confirmation response was not an elicitation result")
 
-        # Deliberately verified against the arguments of *this* call, not the
-        # ones the first round happened to carry.
-        states.verify(
-            ctx.request_state or "",
-            principal=principal,
-            method=_METHOD,
-            params=params,
-            now=now,
-        )
+        # By the time this runs, the SDK has already established the state is
+        # authentic, unexpired, and bound to this exact call. The only question
+        # left is whether it has been spent — and spending it is what stops the
+        # same approval being redeemed twice.
+        ledger.spend(ctx.request_state or "", now=now)
 
         if answer.action != "accept":
             return f"Cancelled: the user answered {answer.action!r}. Nothing was deleted."
@@ -232,22 +205,12 @@ def build_server(
             return "Cancelled: the user did not confirm. Nothing was deleted."
 
         # Re-check the filesystem now, rather than trusting what was true when
-        # the question was asked. The user thought about it in between, and
-        # anything could have replaced the target in that window.
-        # The link check already ran above, on the unresolved path, which is the
-        # only place it can catch a swap. What remains here is the rest of the
-        # re-validation: the file must still be there, and still be a file.
+        # the question was asked.
         if not target.exists():
             raise Rejected(f"{target} no longer exists")
         if not target.is_file():
             raise Rejected(f"{target} is no longer a regular file")
 
-        # The filesystem can still refuse after every check has passed: the file
-        # may be read-only, held open by another process, or on a mount that
-        # went away. Reported as a refusal with the operating system's reason
-        # attached, rather than allowed to surface as a bare OSError - the
-        # caller is a language model deciding what to do next, and "permission
-        # denied" is actionable where a traceback is not.
         try:
             size = target.stat().st_size
             target.unlink()
@@ -262,7 +225,7 @@ def build_server(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="mcp-confirm",
-        description="MCP server demonstrating a confirmation that cannot be replayed.",
+        description="An MCP server closing the three gaps the SDK's request-state boundary leaves.",
     )
     parser.add_argument(
         "--root",
@@ -280,16 +243,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.roots:
         parser.error("at least one --root is required; this server will not default to /")
 
-    # A per-process random secret. Confirmations therefore do not survive a
-    # restart, which is the safe default: a state blob minted by a previous
-    # process refers to a decision this one never witnessed. Set
-    # MCP_CONFIRM_SECRET to share signing across replicas, and read the note in
-    # state.ConfirmationState about single-use enforcement before doing so.
-    env_secret = os.environ.get("MCP_CONFIRM_SECRET")
-    secret = env_secret.encode("utf-8") if env_secret else secrets.token_bytes(32)
-
     try:
-        server = build_server(args.roots, secret=secret, ttl_seconds=args.ttl_seconds)
+        server = build_server(args.roots, ttl_seconds=args.ttl_seconds)
     except Rejected as exc:
         parser.error(str(exc))
         return 2
