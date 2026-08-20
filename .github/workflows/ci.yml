@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    # Ubuntu, not a matrix across operating systems, and deliberately so: the
+    # confirmation-to-execution re-check is proven by a symlink test, and this
+    # sandbox cannot create symlinks on Windows without a privilege CI does not
+    # grant. Running only where that test genuinely executes is more honest
+    # than a green Windows leg that quietly skipped the interesting assertion.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - run: python -m pip install --upgrade pip
+      - run: pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check src tests
+
+      - name: Test
+        run: pytest -q --cov=mcp_confirm --cov-report=term-missing
+
+      - name: The symlink test must actually run here
+        # A suite that silently skips its most important case is decoration.
+        # Linux can create symlinks, so a skip on this runner means the fixture
+        # broke rather than that the platform declined - fail loudly instead of
+        # reporting green.
+        run: |
+          if pytest -q -rs 2>&1 | grep -q "cannot create symlinks"; then
+            echo "::error::The swap-after-confirmation test skipped on Linux, where it should run."
+            exit 1
+          fi
+          echo "Symlink test executed."
