@@ -1,3 +1,4 @@
+<!-- mcp-name: io.github.les-k/mcp-confirm -->
 # mcp-confirm
 
 [![CI](https://github.com/les-k/mcp-confirm/actions/workflows/ci.yml/badge.svg)](https://github.com/les-k/mcp-confirm/actions/workflows/ci.yml)
@@ -123,7 +124,7 @@ symlinks, and the build **fails if they report as skipped there**.
 ## Install
 
 ```bash
-pip install git+https://github.com/les-k/mcp-confirm.git
+pip install mcp-confirm
 ```
 
 ## Run
@@ -174,3 +175,7 @@ deleted. Fixed, with a test for the variant the original never exercised.
 ## Licence
 
 MIT.
+
+## Author
+
+Built by [Leslie Kadenge](https://les-k.github.io). I do independent security reviews of MCP servers; my public survey of thirteen production servers is at [les-k.github.io/field-notes.html](https://les-k.github.io/field-notes.html).

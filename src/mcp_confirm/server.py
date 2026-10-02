@@ -28,12 +28,14 @@ would be worse code guarding an already-closed hole.
 from __future__ import annotations
 
 import argparse
+import functools
 import sys
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import (
     ElicitRequest,
     ElicitRequestFormParams,
@@ -111,6 +113,21 @@ def _contain(path: str, roots: tuple[Path, ...]) -> Path:
     raise Rejected(f"{candidate} is outside the allowed roots ({allowed})")
 
 
+def _refusing(fn):
+    """Surface a refusal to the client. mcp>=2.2 shows the model only the text of a
+    ToolError; any other exception is treated as a crash and reduced to "Error executing
+    tool X", which would hide why a call was refused."""
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await fn(*args, **kwargs)
+        except Rejected as exc:
+            raise ToolError(str(exc)) from exc
+
+    return wrapper
+
+
 def build_server(
     roots: Sequence[Path | str],
     *,
@@ -151,6 +168,7 @@ def build_server(
             open_world_hint=False,
         ),
     )
+    @_refusing
     async def delete_file(path: str, ctx: Context) -> str:
         now = clock()
 
